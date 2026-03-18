@@ -1,6 +1,6 @@
 """
 MCP Pinecone Server - arquivo único
-Ingestão de documentos + acesso MCP universal
+Embeddings via OpenAI text-embedding-3-small (1536 dims)
 """
 
 from fastapi import FastAPI, Request, UploadFile, File, Depends, HTTPException, Header, Form
@@ -13,7 +13,8 @@ import sqlite3, secrets, uuid, hashlib, httpx, io, os, json
 
 DB_PATH = os.getenv("DB_PATH", "mcp_server.db")
 ADMIN_KEY_ENV = os.getenv("ADMIN_KEY", "admin-change-me")
-EMBED_MODEL = "multilingual-e5-large"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+EMBED_MODEL = "text-embedding-3-small"
 CHUNK_SIZE, CHUNK_OVERLAP = 800, 150
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -89,25 +90,20 @@ def chunk_text(text: str) -> List[str]:
         start += CHUNK_SIZE - CHUNK_OVERLAP
     return chunks
 
-async def embed_texts(texts: List[str], api_key: str) -> List[List[float]]:
+async def embed_texts(texts: List[str]) -> List[List[float]]:
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post("https://api.pinecone.io/embed",
-            headers={"Api-Key": api_key, "Content-Type": "application/json"},
-            json={"model": EMBED_MODEL, "inputs": [{"text": t} for t in texts],
-                  "parameters": {"input_type": "passage", "truncate": "END"}})
+        r = await client.post("https://api.openai.com/v1/embeddings",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={"model": EMBED_MODEL, "input": texts})
     if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Embed error: {r.text}")
-    return [d["values"] for d in r.json()["data"]]
+        raise HTTPException(status_code=502, detail=f"OpenAI embed error: {r.text}")
+    data = r.json()["data"]
+    data.sort(key=lambda x: x["index"])
+    return [d["embedding"] for d in data]
 
-async def embed_query(text: str, api_key: str) -> List[float]:
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post("https://api.pinecone.io/embed",
-            headers={"Api-Key": api_key, "Content-Type": "application/json"},
-            json={"model": EMBED_MODEL, "inputs": [{"text": text}],
-                  "parameters": {"input_type": "query", "truncate": "END"}})
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Embed error: {r.text}")
-    return r.json()["data"][0]["values"]
+async def embed_query(text: str) -> List[float]:
+    result = await embed_texts([text])
+    return result[0]
 
 async def upsert_vectors(vectors, host, api_key, namespace):
     h = host if host.startswith("http") else f"https://{host}"
@@ -148,11 +144,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="MCP Pinecone Server", version="1.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ── Health ────────────────────────────────────────────────────────────────────
-
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "mcp-pinecone-server"}
+    return {"status": "ok", "service": "mcp-pinecone-server", "embed_model": EMBED_MODEL}
 
 # ── Admin: Clients ────────────────────────────────────────────────────────────
 
@@ -206,7 +200,7 @@ async def ingest_document(file: UploadFile = File(...),
     text = await extract_text(file)
     if not text.strip(): raise HTTPException(status_code=422, detail="Documento vazio.")
     chunks = chunk_text(text)
-    embeddings = await embed_texts(chunks, client["pinecone_api_key"])
+    embeddings = await embed_texts(chunks)
     extra = json.loads(extra_metadata) if extra_metadata else {}
     doc_id = hashlib.md5(file.filename.encode()).hexdigest()[:8]
     vectors = [{"id": f"{doc_id}_chunk_{i}", "values": emb,
@@ -223,7 +217,7 @@ async def ingest_text(text: str = Form(...), source_name: str = Form("manual_inp
                       client=Depends(get_client)):
     namespace = namespace_override or client["namespace"]
     chunks = chunk_text(text)
-    embeddings = await embed_texts(chunks, client["pinecone_api_key"])
+    embeddings = await embed_texts(chunks)
     doc_id = hashlib.md5(source_name.encode()).hexdigest()[:8]
     vectors = [{"id": f"{doc_id}_chunk_{i}_{uuid.uuid4().hex[:4]}", "values": emb,
                 "metadata": {"source": source_name, "chunk_index": i, "text": c, "client_id": client["id"]}}
@@ -245,7 +239,7 @@ async def search(payload: QueryRequest, client=Depends(get_client)):
     namespace = payload.namespace_override or client["namespace"]
     host = client["pinecone_host"]
     if not host.startswith("http"): host = f"https://{host}"
-    vector = await embed_query(payload.query, client["pinecone_api_key"])
+    vector = await embed_query(payload.query)
     body = {"vector": vector, "topK": payload.top_k, "includeMetadata": True, "includeValues": False, "namespace": namespace}
     if payload.filter: body["filter"] = payload.filter
     async with httpx.AsyncClient(timeout=30) as http:
@@ -274,11 +268,10 @@ MCP_TOOLS = [
     {"name": "search_knowledge_base",
      "description": "Busca semântica na base de conhecimento do cliente.",
      "inputSchema": {"type": "object", "properties": {
-         "query": {"type": "string", "description": "Pergunta ou texto para buscar"},
-         "top_k": {"type": "integer", "default": 5},
+         "query": {"type": "string"}, "top_k": {"type": "integer", "default": 5},
          "namespace": {"type": "string"}}, "required": ["query"]}},
     {"name": "ingest_text",
-     "description": "Ingere texto diretamente na base de conhecimento.",
+     "description": "Ingere texto na base de conhecimento.",
      "inputSchema": {"type": "object", "properties": {
          "text": {"type": "string"}, "source_name": {"type": "string"},
          "namespace": {"type": "string"}}, "required": ["text"]}},
@@ -298,15 +291,13 @@ async def mcp_call(request: Request, client=Depends(get_client)):
     name = body.get("name"); inp = body.get("input", {})
     namespace = inp.get("namespace") or client["namespace"]
     log_usage(client["id"], f"/mcp/call:{name}")
-
     if name == "search_knowledge_base":
         result = await search(QueryRequest(query=inp["query"], top_k=inp.get("top_k", 5),
                                            namespace_override=namespace), client)
         return {"type": "tool_result", "content": result}
-
     elif name == "ingest_text":
         chunks = chunk_text(inp["text"])
-        embeddings = await embed_texts(chunks, client["pinecone_api_key"])
+        embeddings = await embed_texts(chunks)
         source = inp.get("source_name", "mcp_input")
         doc_id = hashlib.md5(source.encode()).hexdigest()[:8]
         vectors = [{"id": f"{doc_id}_chunk_{i}_{uuid.uuid4().hex[:4]}", "values": emb,
@@ -314,9 +305,7 @@ async def mcp_call(request: Request, client=Depends(get_client)):
                    for i, (c, emb) in enumerate(zip(chunks, embeddings))]
         await upsert_vectors(vectors, client["pinecone_host"], client["pinecone_api_key"], namespace)
         return {"type": "tool_result", "content": {"status": "success", "chunks_ingested": len(chunks)}}
-
     elif name == "get_index_stats":
         result = await stats(client)
         return {"type": "tool_result", "content": result}
-
     raise HTTPException(status_code=404, detail=f"Tool '{name}' não encontrada")
