@@ -1,6 +1,7 @@
 """
 MCP Pinecone Server - arquivo único
-Embeddings via OpenAI text-embedding-3-small (1536 dims)
+Embeddings via OpenAI text-embedding-3-small (512 dims)
+Parsing via LlamaParse (multimodal - PDFs, slides, imagens, tabelas)
 """
 
 from fastapi import FastAPI, Request, UploadFile, File, Depends, HTTPException, Header, Form
@@ -9,11 +10,12 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from typing import Optional, List
-import sqlite3, secrets, uuid, hashlib, httpx, io, os, json
+import sqlite3, secrets, uuid, hashlib, httpx, io, os, json, asyncio, time
 
-DB_PATH = os.getenv("DB_PATH", "mcp_server.db")
+DB_PATH = os.getenv("DB_PATH", "/tmp/mcp_server.db")
 ADMIN_KEY_ENV = os.getenv("ADMIN_KEY", "admin-change-me")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+LLAMA_API_KEY = os.getenv("LLAMA_API_KEY", "")
 EMBED_MODEL = "text-embedding-3-small"
 CHUNK_SIZE, CHUNK_OVERLAP = 800, 150
 
@@ -79,7 +81,84 @@ def get_admin(x_admin_key: str = Header(..., alias="X-Admin-Key")):
         raise HTTPException(status_code=403, detail="Admin key inválida")
     return True
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── LlamaParse ────────────────────────────────────────────────────────────────
+
+async def parse_with_llama(content: bytes, filename: str) -> str:
+    """Envia documento para LlamaParse e retorna texto extraído com interpretação multimodal"""
+    async with httpx.AsyncClient(timeout=120) as client:
+        # Upload do arquivo
+        upload = await client.post(
+            "https://api.cloud.llamaindex.ai/api/parsing/upload",
+            headers={"Authorization": f"Bearer {LLAMA_API_KEY}"},
+            files={"file": (filename, content, "application/octet-stream")},
+            data={
+                "language": "pt",
+                "parsing_instruction": (
+                    "Extraia todo o conteúdo deste documento de forma detalhada. "
+                    "Para gráficos e tabelas, descreva os dados numericamente. "
+                    "Para slides, extraia título, bullets e qualquer dado visual. "
+                    "Mantenha a estrutura lógica do conteúdo."
+                ),
+            }
+        )
+        if upload.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"LlamaParse upload error: {upload.text}")
+
+        job_id = upload.json().get("id")
+        if not job_id:
+            raise HTTPException(status_code=502, detail="LlamaParse não retornou job_id")
+
+        # Polling até completar
+        for _ in range(60):
+            await asyncio.sleep(3)
+            status_r = await client.get(
+                f"https://api.cloud.llamaindex.ai/api/parsing/job/{job_id}",
+                headers={"Authorization": f"Bearer {LLAMA_API_KEY}"}
+            )
+            status_data = status_r.json()
+            job_status = status_data.get("status", "")
+            if job_status == "SUCCESS":
+                break
+            elif job_status == "ERROR":
+                raise HTTPException(status_code=502, detail=f"LlamaParse job falhou: {status_data}")
+
+        # Busca resultado em texto
+        result_r = await client.get(
+            f"https://api.cloud.llamaindex.ai/api/parsing/job/{job_id}/result/text",
+            headers={"Authorization": f"Bearer {LLAMA_API_KEY}"}
+        )
+        if result_r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"LlamaParse result error: {result_r.text}")
+
+        return result_r.json().get("text", "")
+
+# ── Fallback text extraction ───────────────────────────────────────────────────
+
+async def extract_text_fallback(content: bytes, filename: str) -> str:
+    name = filename.lower()
+    if name.endswith(".txt") or name.endswith(".md"):
+        return content.decode("utf-8", errors="ignore")
+    if name.endswith(".docx"):
+        try:
+            from docx import Document
+            return "\n".join(p.text for p in Document(io.BytesIO(content)).paragraphs)
+        except ImportError:
+            raise HTTPException(status_code=422, detail="python-docx não instalado")
+    raise HTTPException(status_code=415, detail=f"Formato não suportado: {filename}")
+
+async def extract_text(file: UploadFile) -> str:
+    content = await file.read()
+    name = file.filename.lower()
+    # TXT e MD não precisam de LlamaParse
+    if name.endswith(".txt") or name.endswith(".md"):
+        return content.decode("utf-8", errors="ignore")
+    # Tudo mais passa pelo LlamaParse (PDF, DOCX, PPTX, imagens)
+    if LLAMA_API_KEY:
+        return await parse_with_llama(content, file.filename)
+    # Fallback sem LlamaParse
+    return await extract_text_fallback(content, file.filename)
+
+# ── Chunking & Embedding ──────────────────────────────────────────────────────
 
 def chunk_text(text: str) -> List[str]:
     text = " ".join(text.split())
@@ -102,8 +181,7 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
     return [d["embedding"] for d in data]
 
 async def embed_query(text: str) -> List[float]:
-    result = await embed_texts([text])
-    return result[0]
+    return (await embed_texts([text]))[0]
 
 async def upsert_vectors(vectors, host, api_key, namespace):
     h = host if host.startswith("http") else f"https://{host}"
@@ -115,38 +193,18 @@ async def upsert_vectors(vectors, host, api_key, namespace):
             if r.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"Upsert error: {r.text}")
 
-async def extract_text(file: UploadFile) -> str:
-    content = await file.read()
-    name = file.filename.lower()
-    if name.endswith(".txt") or name.endswith(".md"):
-        return content.decode("utf-8", errors="ignore")
-    if name.endswith(".pdf"):
-        try:
-            import pdfplumber
-            with pdfplumber.open(io.BytesIO(content)) as pdf:
-                return "\n".join(p.extract_text() or "" for p in pdf.pages)
-        except ImportError:
-            raise HTTPException(status_code=422, detail="pdfplumber não instalado")
-    if name.endswith(".docx"):
-        try:
-            from docx import Document
-            return "\n".join(p.text for p in Document(io.BytesIO(content)).paragraphs)
-        except ImportError:
-            raise HTTPException(status_code=422, detail="python-docx não instalado")
-    raise HTTPException(status_code=415, detail=f"Formato não suportado: {name}")
-
 # ── App ───────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db(); yield
 
-app = FastAPI(title="MCP Pinecone Server", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="MCP Pinecone Server", version="2.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "mcp-pinecone-server", "embed_model": EMBED_MODEL}
+    return {"status": "ok", "version": "2.0.0", "llama_parse": bool(LLAMA_API_KEY), "embed_model": EMBED_MODEL}
 
 # ── Admin: Clients ────────────────────────────────────────────────────────────
 
@@ -163,8 +221,7 @@ def create_client(payload: ClientCreate, _=Depends(get_admin)):
     conn.execute("INSERT INTO clients (id,name,email,api_key,pinecone_api_key,pinecone_host,namespace,notes) VALUES (?,?,?,?,?,?,?,?)",
                  (cid, payload.name, payload.email, key, payload.pinecone_api_key, payload.pinecone_host, payload.namespace, payload.notes))
     conn.commit(); conn.close()
-    return {"client_id": cid, "name": payload.name, "api_key": key, "namespace": payload.namespace,
-            "message": "Guarde a api_key — não será exibida novamente."}
+    return {"client_id": cid, "name": payload.name, "api_key": key, "namespace": payload.namespace}
 
 @app.get("/admin/clients")
 def list_clients(_=Depends(get_admin)):
@@ -209,7 +266,7 @@ async def ingest_document(file: UploadFile = File(...),
     await upsert_vectors(vectors, client["pinecone_host"], client["pinecone_api_key"], namespace)
     log_ingestion(client["id"], file.filename, len(chunks), "success")
     log_usage(client["id"], "/ingest/document")
-    return {"status": "success", "filename": file.filename, "chunks_ingested": len(chunks), "namespace": namespace}
+    return {"status": "success", "filename": file.filename, "chunks_ingested": len(chunks), "namespace": namespace, "parser": "llamaparse"}
 
 @app.post("/ingest/text")
 async def ingest_text(text: str = Form(...), source_name: str = Form("manual_input"),
