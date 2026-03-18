@@ -291,24 +291,87 @@ class QueryRequest(BaseModel):
     namespace_override: Optional[str] = None
     filter: Optional[dict] = None
 
-@app.post("/query/search")
-async def search(payload: QueryRequest, client=Depends(get_client)):
-    namespace = payload.namespace_override or client["namespace"]
+async def pinecone_search(query: str, top_k: int, namespace: str, client: dict) -> list:
     host = client["pinecone_host"]
     if not host.startswith("http"): host = f"https://{host}"
-    vector = await embed_query(payload.query)
-    body = {"vector": vector, "topK": payload.top_k, "includeMetadata": True, "includeValues": False, "namespace": namespace}
-    if payload.filter: body["filter"] = payload.filter
+    vector = await embed_query(query)
+    body = {"vector": vector, "topK": top_k, "includeMetadata": True, "includeValues": False, "namespace": namespace}
     async with httpx.AsyncClient(timeout=30) as http:
         r = await http.post(f"{host}/query", headers={"Api-Key": client["pinecone_api_key"], "Content-Type": "application/json"}, json=body)
     if r.status_code != 200: raise HTTPException(status_code=502, detail=r.text)
-    matches = r.json().get("matches", [])
+    return r.json().get("matches", [])
+
+async def generate_answer(query: str, chunks: list, client_name: str) -> str:
+    context = "
+
+---
+
+".join([
+        f"[Fonte: {c.get(chr(39)metadata{chr(39)}, {}).get(chr(39)source{chr(39)}, chr(39)desconhecido{chr(39)})}]
+{c.get(chr(39)metadata{chr(39)}, {}).get(chr(39)text{chr(39)}, chr(39){chr(39)})}"
+        for c in chunks
+    ])
+    messages = [
+        {"role": "system", "content": (
+            f"Voce e um assistente especializado no conteudo de {client_name}. "
+            "Responda com base APENAS nos trechos fornecidos abaixo. "
+            "Se a informacao nao estiver nos trechos, diga que nao encontrou. "
+            "Seja direto, claro e estruturado. Use listas quando fizer sentido."
+        )},
+        {"role": "user", "content": f"Pergunta: {query}
+
+Trechos relevantes:
+{context}"}
+    ]
+    async with httpx.AsyncClient(timeout=60) as http:
+        r = await http.post("https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={"model": "gpt-4o-mini", "messages": messages, "temperature": 0.3})
+    if r.status_code != 200: raise HTTPException(status_code=502, detail=f"GPT error: {r.text}")
+    return r.json()["choices"][0]["message"]["content"]
+
+@app.post("/query/search")
+async def search(payload: QueryRequest, client=Depends(get_client)):
+    namespace = payload.namespace_override or client["namespace"]
+    matches = await pinecone_search(payload.query, payload.top_k, namespace, client)
     log_usage(client["id"], "/query/search")
     return {"query": payload.query, "namespace": namespace, "total_matches": len(matches),
             "results": [{"id": m["id"], "score": round(m["score"], 4),
                          "text": m.get("metadata", {}).get("text", ""),
                          "source": m.get("metadata", {}).get("source", ""),
                          "metadata": m.get("metadata", {})} for m in matches]}
+
+@app.post("/query/ask")
+async def ask(payload: QueryRequest, client=Depends(get_client)):
+    namespace = payload.namespace_override or client["namespace"]
+    matches = await pinecone_search(payload.query, payload.top_k, namespace, client)
+    if not matches:
+        return {"query": payload.query, "answer": "Nao encontrei informacoes sobre isso na base.", "sources": []}
+    context = "
+
+---
+
+".join([
+        f"[Fonte: {m.get(chr(39)metadata{chr(39)},{}).get(chr(39)source{chr(39)},chr(39){chr(39)})}]
+{m.get(chr(39)metadata{chr(39)},{}).get(chr(39)text{chr(39)},chr(39){chr(39)})}"
+        for m in matches
+    ])
+    messages = [
+        {"role": "system", "content": f"Voce e assistente especializado no conteudo de {client[chr(39)name{chr(39)}]}. Responda com base APENAS nos trechos. Seja claro e estruturado."},
+        {"role": "user", "content": f"Pergunta: {payload.query}
+
+Trechos:
+{context}"}
+    ]
+    async with httpx.AsyncClient(timeout=60) as http:
+        r = await http.post("https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={"model": "gpt-4o-mini", "messages": messages, "temperature": 0.3})
+    if r.status_code != 200: raise HTTPException(status_code=502, detail=f"GPT error: {r.text}")
+    answer = r.json()["choices"][0]["message"]["content"]
+    sources = list(set([m.get("metadata", {}).get("source", "") for m in matches]))
+    log_usage(client["id"], "/query/ask")
+    return {"query": payload.query, "answer": answer, "sources": sources, "chunks_used": len(matches)}
 
 @app.get("/query/stats")
 async def stats(client=Depends(get_client)):
