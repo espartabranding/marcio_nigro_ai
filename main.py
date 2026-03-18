@@ -94,7 +94,7 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post("https://api.openai.com/v1/embeddings",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model": EMBED_MODEL, "input": texts, "dimensions": 1024})
+            json={"model": EMBED_MODEL, "input": texts, "dimensions": 512})
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail=f"OpenAI embed error: {r.text}")
     data = r.json()["data"]
