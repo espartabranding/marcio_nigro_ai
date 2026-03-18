@@ -1,0 +1,5 @@
+# Chave do admin para gerenciar clientes via /admin/*
+ADMIN_KEY=troque-por-uma-chave-forte-aqui
+
+# Path do banco SQLite (opcional, padrão: mcp_server.db)
+DB_PATH=mcp_server.db
