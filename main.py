@@ -163,17 +163,23 @@ def chunk_text(text: str) -> List[str]:
     return chunks
 
 async def embed_texts(texts: List[str]) -> List[List[float]]:
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(
-            "https://api.openai.com/v1/embeddings",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model": EMBED_MODEL, "input": texts, "dimensions": 512}
-        )
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"OpenAI embed error: {r.text}")
-    data = r.json()["data"]
-    data.sort(key=lambda x: x["index"])
-    return [d["embedding"] for d in data]
+    """Embeda em lotes de 50 para evitar limite de tokens da OpenAI"""
+    all_embeddings = []
+    batch_size = 50
+    async with httpx.AsyncClient(timeout=120) as client:
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            r = await client.post(
+                "https://api.openai.com/v1/embeddings",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json={"model": EMBED_MODEL, "input": batch, "dimensions": 512}
+            )
+            if r.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"OpenAI embed error: {r.text}")
+            data = r.json()["data"]
+            data.sort(key=lambda x: x["index"])
+            all_embeddings.extend([d["embedding"] for d in data])
+    return all_embeddings
 
 async def embed_query(text: str) -> List[float]:
     return (await embed_texts([text]))[0]
