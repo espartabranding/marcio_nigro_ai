@@ -45,7 +45,7 @@ def init_db():
 def log_usage(client_id, endpoint):
     try:
         conn = get_conn()
-        conn.execute("INSERT INTO api_usage (client_id, endpoint) VALUES (?, ?)", [client_id, endpoint])
+        conn.execute("INSERT INTO api_usage (client_id, endpoint) VALUES (?, ?)", (client_id, endpoint))
         conn.commit()
     except Exception:
         pass
@@ -54,7 +54,7 @@ def log_ingestion(client_id, filename, chunks, status):
     try:
         conn = get_conn()
         conn.execute("INSERT INTO ingestion_log (client_id, filename, chunks, status) VALUES (?, ?, ?, ?)",
-                     [client_id, filename, chunks, status])
+                     (client_id, filename, chunks, status))
         conn.commit()
     except Exception:
         pass
@@ -65,7 +65,7 @@ def get_client(x_api_key: str = Depends(api_key_header)):
     if not x_api_key:
         raise HTTPException(status_code=401, detail="X-API-Key header obrigatorio")
     conn = get_conn()
-    result = conn.execute("SELECT id,name,email,api_key,pinecone_api_key,pinecone_host,namespace,active,created_at,notes FROM clients WHERE api_key = ? AND active = 1", [x_api_key])
+    result = conn.execute("SELECT id,name,email,api_key,pinecone_api_key,pinecone_host,namespace,active,created_at,notes FROM clients WHERE api_key = ? AND active = 1", (x_api_key,))
     row = result.fetchone()
     if not row:
         raise HTTPException(status_code=403, detail="API Key invalida ou cliente inativo")
@@ -240,7 +240,7 @@ def create_client(payload: ClientCreate, _=Depends(get_admin)):
     conn = get_conn()
     conn.execute(
         "INSERT INTO clients (id,name,email,api_key,pinecone_api_key,pinecone_host,namespace,notes) VALUES (?,?,?,?,?,?,?,?)",
-        [cid, payload.name, payload.email, key, payload.pinecone_api_key, payload.pinecone_host, payload.namespace, payload.notes]
+        (cid, payload.name, payload.email, key, payload.pinecone_api_key, payload.pinecone_host, payload.namespace, payload.notes)
     )
     conn.commit()
     return {"client_id": cid, "name": payload.name, "api_key": key, "namespace": payload.namespace}
@@ -259,15 +259,15 @@ def list_clients(_=Depends(get_admin)):
 def rotate_key(client_id: str, _=Depends(get_admin)):
     new_key = f"mcp_{secrets.token_urlsafe(32)}"
     conn = get_conn()
-    conn.execute("UPDATE clients SET api_key=? WHERE id=?", [new_key, client_id])
+    conn.execute("UPDATE clients SET api_key=? WHERE id=?", (new_key, client_id))
     conn.commit()
     return {"api_key": new_key}
 
 @app.get("/admin/clients/{client_id}/usage")
 def client_usage(client_id: str, _=Depends(get_admin)):
     conn = get_conn()
-    usage_rows = conn.execute("SELECT endpoint,COUNT(*) FROM api_usage WHERE client_id=? GROUP BY endpoint", [client_id]).fetchall()
-    log_rows = conn.execute("SELECT filename,chunks,status,created_at FROM ingestion_log WHERE client_id=? ORDER BY created_at DESC LIMIT 50", [client_id]).fetchall()
+    usage_rows = conn.execute("SELECT endpoint,COUNT(*) FROM api_usage WHERE client_id=? GROUP BY endpoint", (client_id,)).fetchall()
+    log_rows = conn.execute("SELECT filename,chunks,status,created_at FROM ingestion_log WHERE client_id=? ORDER BY created_at DESC LIMIT 50", (client_id,)).fetchall()
     return {
         "usage": [{"endpoint": r[0], "calls": r[1]} for r in usage_rows],
         "ingestions": [{"filename": r[0], "chunks": r[1], "status": r[2], "created_at": r[3]} for r in log_rows]
@@ -370,7 +370,7 @@ async def list_documents(client=Depends(get_client)):
     conn = get_conn()
     rows = conn.execute(
         "SELECT filename, chunks, status, created_at FROM ingestion_log WHERE client_id=? AND status='success' ORDER BY created_at DESC",
-        [client["id"]]
+        (client["id"],)
     ).fetchall()
     docs = [{"filename": r[0], "chunks": r[1], "status": r[2], "created_at": r[3]} for r in rows]
     unique = {}
