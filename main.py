@@ -463,7 +463,7 @@ async def list_documents(client=Depends(get_client)):
                     headers={"Api-Key": client["pinecone_api_key"], "Content-Type": "application/json"},
                     json={
                         "vector": sample_vector,
-                        "topK": 100,
+                        "topK": 200,
                         "includeMetadata": True,
                         "includeValues": False,
                         "namespace": ns
