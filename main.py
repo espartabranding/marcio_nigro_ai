@@ -64,13 +64,38 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 def get_client(x_api_key: str = Depends(api_key_header)):
     if not x_api_key:
         raise HTTPException(status_code=401, detail="X-API-Key header obrigatorio")
-    conn = get_conn()
-    result = conn.execute("SELECT id,name,email,api_key,pinecone_api_key,pinecone_host,namespace,active,created_at,notes FROM clients WHERE api_key = ? AND active = 1", (x_api_key,))
-    row = result.fetchone()
-    if not row:
-        raise HTTPException(status_code=403, detail="API Key invalida ou cliente inativo")
-    cols = ["id","name","email","api_key","pinecone_api_key","pinecone_host","namespace","active","created_at","notes"]
-    return dict(zip(cols, row))
+    
+    # Verifica clientes fixos configurados via variavel de ambiente
+    # Formato: FIXED_CLIENT_nome=apikey|pinecone_api_key|pinecone_host|namespace
+    for key, val in os.environ.items():
+        if key.startswith("FIXED_CLIENT_") and val.startswith(x_api_key + "|"):
+            parts = val.split("|")
+            if len(parts) >= 4 and parts[0] == x_api_key:
+                return {
+                    "id": key,
+                    "name": key.replace("FIXED_CLIENT_", "").replace("_", " "),
+                    "email": "",
+                    "api_key": x_api_key,
+                    "pinecone_api_key": parts[1],
+                    "pinecone_host": parts[2],
+                    "namespace": parts[3],
+                    "active": 1,
+                    "created_at": "",
+                    "notes": "fixed_client"
+                }
+    
+    # Verifica no banco Turso
+    try:
+        conn = get_conn()
+        result = conn.execute("SELECT id,name,email,api_key,pinecone_api_key,pinecone_host,namespace,active,created_at,notes FROM clients WHERE api_key = ? AND active = 1", (x_api_key,))
+        row = result.fetchone()
+        if row:
+            cols = ["id","name","email","api_key","pinecone_api_key","pinecone_host","namespace","active","created_at","notes"]
+            return dict(zip(cols, row))
+    except Exception:
+        pass
+    
+    raise HTTPException(status_code=403, detail="API Key invalida ou cliente inativo")
 
 def get_admin(x_admin_key: str = Header(..., alias="X-Admin-Key")):
     if x_admin_key != ADMIN_KEY_ENV:
@@ -244,6 +269,21 @@ def create_client(payload: ClientCreate, _=Depends(get_admin)):
     )
     conn.commit()
     return {"client_id": cid, "name": payload.name, "api_key": key, "namespace": payload.namespace}
+
+
+@app.get("/admin/latest-key")
+def get_latest_key(name: str, _=Depends(get_admin)):
+    """Retorna a API key do cliente mais recente pelo nome"""
+    conn = get_conn()
+    result = conn.execute(
+        "SELECT id, name, api_key, namespace, created_at FROM clients WHERE name LIKE ? AND active=1 ORDER BY created_at DESC LIMIT 1",
+        (f"%{name}%",)
+    )
+    row = result.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Cliente nao encontrado")
+    cols = ["id", "name", "api_key", "namespace", "created_at"]
+    return dict(zip(cols, row))
 
 @app.get("/admin/clients")
 def list_clients(_=Depends(get_admin)):
