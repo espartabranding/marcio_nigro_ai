@@ -354,14 +354,26 @@ async def search(payload: QueryRequest, client=Depends(get_client)):
 
 @app.post("/query/ask")
 async def ask(payload: QueryRequest, client=Depends(get_client)):
-    namespace = payload.namespace_override or client["namespace"]
-    matches = await pinecone_search(payload.query, payload.top_k, namespace, client)
+    # Se namespace especificado, busca só nele. Senão, busca em todos.
+    if payload.namespace_override:
+        matches = await pinecone_search(payload.query, payload.top_k, payload.namespace_override, client)
+    else:
+        # Busca em todos os namespaces conhecidos
+        all_namespaces = ["palestras", "delegacao", "ebook", "masterclass", "resumo", "aula", "planejamento", "lideranca", "empreendedorismo"]
+        all_matches = []
+        for ns in all_namespaces:
+            ns_matches = await pinecone_search(payload.query, 3, ns, client)
+            all_matches.extend(ns_matches)
+        # Ordena por score e pega os melhores
+        all_matches.sort(key=lambda x: x.get("score", 0), reverse=True)
+        matches = all_matches[:payload.top_k]
+    
     if not matches:
         return {"query": payload.query, "answer": "Nao encontrei informacoes sobre isso na base de conhecimento.", "sources": [], "chunks_used": 0}
     answer = await generate_answer(payload.query, matches, client["name"])
     sources = list(set([m.get("metadata", {}).get("source", "") for m in matches]))
     log_usage(client["id"], "/query/ask")
-    return {"query": payload.query, "answer": answer, "sources": sources, "chunks_used": len(matches), "namespace": namespace}
+    return {"query": payload.query, "answer": answer, "sources": sources, "chunks_used": len(matches)}
 
 
 @app.get("/query/documents")
@@ -386,35 +398,43 @@ async def list_documents(client=Depends(get_client)):
         for ns_data in namespaces.values():
             total_vectors += ns_data.get("vectorCount", 0)
 
-    # Faz uma busca semântica ampla para recuperar metadados de documentos
-    # Usa um vetor zero para listar amostras de vetores existentes
+    # Busca em todos os namespaces para listar todos os documentos
     try:
-        sample_vector = await embed_query("documentos palestras conteudo")
-        async with httpx.AsyncClient(timeout=30) as http:
-            query_r = await http.post(
-                f"{host}/query",
-                headers={"Api-Key": client["pinecone_api_key"], "Content-Type": "application/json"},
-                json={
-                    "vector": sample_vector,
-                    "topK": 100,
-                    "includeMetadata": True,
-                    "includeValues": False,
-                    "namespace": client["namespace"]
-                }
-            )
-        
+        sample_vector = await embed_query("documentos conteudo conhecimento")
         sources = {}
-        if query_r.status_code == 200:
-            matches = query_r.json().get("matches", [])
-            for m in matches:
-                source = m.get("metadata", {}).get("source", "")
-                total_chunks = m.get("metadata", {}).get("total_chunks", 0)
-                if source and source not in sources:
-                    sources[source] = {
-                        "filename": source,
-                        "chunks": total_chunks,
-                        "status": "ingerido"
+        
+        # Lista de namespaces para buscar
+        ns_list = list(namespaces.keys()) if namespaces else [client["namespace"]]
+        if not ns_list:
+            ns_list = [client["namespace"]]
+        
+        async with httpx.AsyncClient(timeout=60) as http:
+            for ns in ns_list:
+                if ns == "conteudos":  # namespace vazio, pular
+                    continue
+                query_r = await http.post(
+                    f"{host}/query",
+                    headers={"Api-Key": client["pinecone_api_key"], "Content-Type": "application/json"},
+                    json={
+                        "vector": sample_vector,
+                        "topK": 100,
+                        "includeMetadata": True,
+                        "includeValues": False,
+                        "namespace": ns
                     }
+                )
+                if query_r.status_code == 200:
+                    matches = query_r.json().get("matches", [])
+                    for m in matches:
+                        source = m.get("metadata", {}).get("source", "")
+                        total_chunks = m.get("metadata", {}).get("total_chunks", 0)
+                        if source and source not in sources:
+                            sources[source] = {
+                                "filename": source,
+                                "chunks": total_chunks,
+                                "namespace": ns,
+                                "status": "ingerido"
+                            }
         
         docs = list(sources.values())
         docs.sort(key=lambda x: x["filename"])
