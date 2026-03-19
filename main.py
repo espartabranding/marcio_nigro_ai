@@ -4,55 +4,60 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from typing import Optional, List
-import sqlite3, secrets, uuid, hashlib, httpx, io, os, json, asyncio
+import secrets, uuid, hashlib, httpx, io, os, json, asyncio
+import libsql_experimental as libsql
 
-DB_PATH = os.getenv("DB_PATH", "/tmp/mcp_server.db")
 ADMIN_KEY_ENV = os.getenv("ADMIN_KEY", "admin-change-me")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 LLAMA_API_KEY = os.getenv("LLAMA_API_KEY", "")
+TURSO_URL = os.getenv("TURSO_URL", "")
+TURSO_TOKEN = os.getenv("TURSO_TOKEN", "")
 EMBED_MODEL = "text-embedding-3-small"
 CHUNK_SIZE, CHUNK_OVERLAP = 800, 150
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
     return conn
 
 def init_db():
     conn = get_conn()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS clients (
-            id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT,
-            api_key TEXT UNIQUE NOT NULL, pinecone_api_key TEXT NOT NULL,
-            pinecone_host TEXT NOT NULL, namespace TEXT NOT NULL DEFAULT 'default',
-            active INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')), notes TEXT
-        );
-        CREATE TABLE IF NOT EXISTS api_usage (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, client_id TEXT NOT NULL,
-            endpoint TEXT NOT NULL, tokens_used INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS ingestion_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, client_id TEXT NOT NULL,
-            filename TEXT NOT NULL, chunks INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-    """)
+    conn.execute("""CREATE TABLE IF NOT EXISTS clients (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT,
+        api_key TEXT UNIQUE NOT NULL, pinecone_api_key TEXT NOT NULL,
+        pinecone_host TEXT NOT NULL, namespace TEXT NOT NULL DEFAULT 'default',
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')), notes TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS api_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, client_id TEXT NOT NULL,
+        endpoint TEXT NOT NULL, tokens_used INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS ingestion_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, client_id TEXT NOT NULL,
+        filename TEXT NOT NULL, chunks INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )""")
     conn.commit()
     conn.close()
 
 def log_usage(client_id, endpoint):
-    conn = get_conn()
-    conn.execute("INSERT INTO api_usage (client_id, endpoint) VALUES (?, ?)", (client_id, endpoint))
-    conn.commit(); conn.close()
+    try:
+        conn = get_conn()
+        conn.execute("INSERT INTO api_usage (client_id, endpoint) VALUES (?, ?)", [client_id, endpoint])
+        conn.commit()
+    except Exception:
+        pass
 
 def log_ingestion(client_id, filename, chunks, status):
-    conn = get_conn()
-    conn.execute("INSERT INTO ingestion_log (client_id, filename, chunks, status) VALUES (?, ?, ?, ?)",
-                 (client_id, filename, chunks, status))
-    conn.commit(); conn.close()
+    try:
+        conn = get_conn()
+        conn.execute("INSERT INTO ingestion_log (client_id, filename, chunks, status) VALUES (?, ?, ?, ?)",
+                     [client_id, filename, chunks, status])
+        conn.commit()
+    except Exception:
+        pass
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -60,11 +65,12 @@ def get_client(x_api_key: str = Depends(api_key_header)):
     if not x_api_key:
         raise HTTPException(status_code=401, detail="X-API-Key header obrigatorio")
     conn = get_conn()
-    row = conn.execute("SELECT * FROM clients WHERE api_key = ? AND active = 1", (x_api_key,)).fetchone()
-    conn.close()
+    result = conn.execute("SELECT id,name,email,api_key,pinecone_api_key,pinecone_host,namespace,active,created_at,notes FROM clients WHERE api_key = ? AND active = 1", [x_api_key])
+    row = result.fetchone()
     if not row:
         raise HTTPException(status_code=403, detail="API Key invalida ou cliente inativo")
-    return dict(row)
+    cols = ["id","name","email","api_key","pinecone_api_key","pinecone_host","namespace","active","created_at","notes"]
+    return dict(zip(cols, row))
 
 def get_admin(x_admin_key: str = Header(..., alias="X-Admin-Key")):
     if x_admin_key != ADMIN_KEY_ENV:
@@ -234,35 +240,38 @@ def create_client(payload: ClientCreate, _=Depends(get_admin)):
     conn = get_conn()
     conn.execute(
         "INSERT INTO clients (id,name,email,api_key,pinecone_api_key,pinecone_host,namespace,notes) VALUES (?,?,?,?,?,?,?,?)",
-        (cid, payload.name, payload.email, key, payload.pinecone_api_key, payload.pinecone_host, payload.namespace, payload.notes)
+        [cid, payload.name, payload.email, key, payload.pinecone_api_key, payload.pinecone_host, payload.namespace, payload.notes]
     )
-    conn.commit(); conn.close()
+    conn.commit()
     return {"client_id": cid, "name": payload.name, "api_key": key, "namespace": payload.namespace}
 
 @app.get("/admin/clients")
 def list_clients(_=Depends(get_admin)):
     conn = get_conn()
-    rows = conn.execute(
-        "SELECT id,name,email,namespace,active,created_at,notes,substr(api_key,1,12)||'...' as api_key_preview FROM clients ORDER BY created_at DESC"
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    result = conn.execute(
+        "SELECT id,name,email,namespace,active,created_at,notes,substr(api_key,1,12)||'...' FROM clients ORDER BY created_at DESC"
+    )
+    rows = result.fetchall()
+    cols = ["id","name","email","namespace","active","created_at","notes","api_key_preview"]
+    return [dict(zip(cols, r)) for r in rows]
 
 @app.post("/admin/clients/{client_id}/rotate-key")
 def rotate_key(client_id: str, _=Depends(get_admin)):
     new_key = f"mcp_{secrets.token_urlsafe(32)}"
     conn = get_conn()
-    conn.execute("UPDATE clients SET api_key=? WHERE id=?", (new_key, client_id))
-    conn.commit(); conn.close()
+    conn.execute("UPDATE clients SET api_key=? WHERE id=?", [new_key, client_id])
+    conn.commit()
     return {"api_key": new_key}
 
 @app.get("/admin/clients/{client_id}/usage")
 def client_usage(client_id: str, _=Depends(get_admin)):
     conn = get_conn()
-    usage = conn.execute("SELECT endpoint,COUNT(*) as calls FROM api_usage WHERE client_id=? GROUP BY endpoint", (client_id,)).fetchall()
-    logs = conn.execute("SELECT filename,chunks,status,created_at FROM ingestion_log WHERE client_id=? ORDER BY created_at DESC LIMIT 50", (client_id,)).fetchall()
-    conn.close()
-    return {"usage": [dict(r) for r in usage], "ingestions": [dict(r) for r in logs]}
+    usage_rows = conn.execute("SELECT endpoint,COUNT(*) FROM api_usage WHERE client_id=? GROUP BY endpoint", [client_id]).fetchall()
+    log_rows = conn.execute("SELECT filename,chunks,status,created_at FROM ingestion_log WHERE client_id=? ORDER BY created_at DESC LIMIT 50", [client_id]).fetchall()
+    return {
+        "usage": [{"endpoint": r[0], "calls": r[1]} for r in usage_rows],
+        "ingestions": [{"filename": r[0], "chunks": r[1], "status": r[2], "created_at": r[3]} for r in log_rows]
+    }
 
 @app.post("/ingest/document")
 async def ingest_document(
@@ -361,10 +370,9 @@ async def list_documents(client=Depends(get_client)):
     conn = get_conn()
     rows = conn.execute(
         "SELECT filename, chunks, status, created_at FROM ingestion_log WHERE client_id=? AND status='success' ORDER BY created_at DESC",
-        (client["id"],)
+        [client["id"]]
     ).fetchall()
-    conn.close()
-    docs = [dict(r) for r in rows]
+    docs = [{"filename": r[0], "chunks": r[1], "status": r[2], "created_at": r[3]} for r in rows]
     unique = {}
     for d in docs:
         if d["filename"] not in unique:
