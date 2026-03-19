@@ -78,7 +78,7 @@ def get_admin(x_admin_key: str = Header(..., alias="X-Admin-Key")):
     return True
 
 async def parse_with_llama(content: bytes, filename: str) -> str:
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(timeout=600) as client:
         upload = await client.post(
             "https://api.cloud.llamaindex.ai/api/parsing/upload",
             headers={"Authorization": f"Bearer {LLAMA_API_KEY}"},
@@ -366,21 +366,73 @@ async def ask(payload: QueryRequest, client=Depends(get_client)):
 
 @app.get("/query/documents")
 async def list_documents(client=Depends(get_client)):
-    """Lista todos os documentos ingeridos na base do cliente"""
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT filename, chunks, status, created_at FROM ingestion_log WHERE client_id=? AND status='success' ORDER BY created_at DESC",
-        (client["id"],)
-    ).fetchall()
-    docs = [{"filename": r[0], "chunks": r[1], "status": r[2], "created_at": r[3]} for r in rows]
-    unique = {}
-    for d in docs:
-        if d["filename"] not in unique:
-            unique[d["filename"]] = d
-    return {
-        "total_documents": len(unique),
-        "documents": list(unique.values())
-    }
+    """Lista documentos direto do Pinecone via metadados dos vetores"""
+    host = client["pinecone_host"]
+    if not host.startswith("http"):
+        host = f"https://{host}"
+
+    # Busca stats para saber total de vetores
+    async with httpx.AsyncClient(timeout=30) as http:
+        stats_r = await http.post(
+            f"{host}/describe_index_stats",
+            headers={"Api-Key": client["pinecone_api_key"], "Content-Type": "application/json"},
+            json={}
+        )
+    total_vectors = 0
+    namespaces = {}
+    if stats_r.status_code == 200:
+        stats_data = stats_r.json()
+        namespaces = stats_data.get("namespaces", {})
+        for ns_data in namespaces.values():
+            total_vectors += ns_data.get("vectorCount", 0)
+
+    # Faz uma busca semântica ampla para recuperar metadados de documentos
+    # Usa um vetor zero para listar amostras de vetores existentes
+    try:
+        sample_vector = await embed_query("documentos palestras conteudo")
+        async with httpx.AsyncClient(timeout=30) as http:
+            query_r = await http.post(
+                f"{host}/query",
+                headers={"Api-Key": client["pinecone_api_key"], "Content-Type": "application/json"},
+                json={
+                    "vector": sample_vector,
+                    "topK": 100,
+                    "includeMetadata": True,
+                    "includeValues": False,
+                    "namespace": client["namespace"]
+                }
+            )
+        
+        sources = {}
+        if query_r.status_code == 200:
+            matches = query_r.json().get("matches", [])
+            for m in matches:
+                source = m.get("metadata", {}).get("source", "")
+                total_chunks = m.get("metadata", {}).get("total_chunks", 0)
+                if source and source not in sources:
+                    sources[source] = {
+                        "filename": source,
+                        "chunks": total_chunks,
+                        "status": "ingerido"
+                    }
+        
+        docs = list(sources.values())
+        docs.sort(key=lambda x: x["filename"])
+        
+        return {
+            "total_documents": len(docs),
+            "total_vectors": total_vectors,
+            "namespaces": list(namespaces.keys()),
+            "documents": docs
+        }
+    except Exception as e:
+        return {
+            "total_documents": 0,
+            "total_vectors": total_vectors,
+            "namespaces": list(namespaces.keys()),
+            "documents": [],
+            "error": str(e)
+        }
 
 @app.get("/query/stats")
 async def stats(client=Depends(get_client)):
