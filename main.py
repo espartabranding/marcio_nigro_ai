@@ -354,6 +354,26 @@ async def ask(payload: QueryRequest, client=Depends(get_client)):
     log_usage(client["id"], "/query/ask")
     return {"query": payload.query, "answer": answer, "sources": sources, "chunks_used": len(matches), "namespace": namespace}
 
+
+@app.get("/query/documents")
+async def list_documents(client=Depends(get_client)):
+    """Lista todos os documentos ingeridos na base do cliente"""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT filename, chunks, status, created_at FROM ingestion_log WHERE client_id=? AND status='success' ORDER BY created_at DESC",
+        (client["id"],)
+    ).fetchall()
+    conn.close()
+    docs = [dict(r) for r in rows]
+    unique = {}
+    for d in docs:
+        if d["filename"] not in unique:
+            unique[d["filename"]] = d
+    return {
+        "total_documents": len(unique),
+        "documents": list(unique.values())
+    }
+
 @app.get("/query/stats")
 async def stats(client=Depends(get_client)):
     host = client["pinecone_host"]
